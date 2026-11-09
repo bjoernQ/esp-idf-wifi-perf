@@ -1,0 +1,23 @@
+menu "Wi-Fi Bench Configuration"
+
+    config BENCH_WIFI_SSID
+        string "WiFi SSID"
+        default "SSID"
+        help
+            SSID (network name) to join. Maximum 31 characters.
+
+    config BENCH_WIFI_PASSWORD
+        string "WiFi Password"
+        default "PASSWORD"
+        help
+            WPA2-Personal password. Leave empty for an open network.
+            Maximum 63 characters.
+
+    config BENCH_HOST_IP
+        string "Benchmark server IPv4 address"
+        default "192.168.0.24"
+        help
+            IPv4 address of the machine running extras/bench-server
+            from esp-hal. The bench uses TCP ports 4321, 4322 and 4323.
+
+endmenu
