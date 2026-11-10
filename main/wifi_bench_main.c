@@ -43,10 +43,18 @@
 static EventGroupHandle_t s_wifi_event_group;
 static TaskHandle_t s_reconnect_task;
 
+/* Ends a test by shutting the socket down, which wakes any blocked send/recv. */
+typedef struct {
+    esp_timer_handle_t timer;
+    int sock;
+    volatile bool expired;
+    volatile bool cb_done;
+} deadline_t;
+
+static deadline_t s_deadline;
+
 typedef struct {
     int sock;
-    int64_t deadline;
-    volatile bool cancel;
     volatile bool tx_done;
     volatile bool rx_done;
     volatile size_t total;
@@ -126,11 +134,6 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
 
-static bool would_block(int err)
-{
-    return err == EAGAIN || err == EWOULDBLOCK;
-}
-
 static void set_socket_timeout(int sock, int timeout_ms)
 {
     struct timeval tv = {
@@ -155,21 +158,39 @@ static int sock_wait(int sock, bool for_write, int timeout_ms)
     return select(sock + 1, read_fds, write_fds, NULL, &tv);
 }
 
-/* Wait at most 10s, and never past the test deadline. */
-static int sock_wait_until(int sock, bool for_write, int64_t deadline)
+static void deadline_cb(void *arg)
 {
-    int64_t left_us = deadline - esp_timer_get_time();
-    if (left_us <= 0) {
-        return 0;
+    (void)arg;
+    s_deadline.expired = true;
+    shutdown(s_deadline.sock, SHUT_RDWR);
+    s_deadline.cb_done = true;
+}
+
+static void deadline_init(void)
+{
+    const esp_timer_create_args_t args = {
+        .callback = deadline_cb,
+        .name = "bench_deadline",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&args, &s_deadline.timer));
+}
+
+static void deadline_start(int sock)
+{
+    s_deadline.sock = sock;
+    s_deadline.expired = false;
+    s_deadline.cb_done = false;
+    ESP_ERROR_CHECK(esp_timer_start_once(s_deadline.timer, (uint64_t)TEST_DURATION_S * 1000000));
+}
+
+/* Must return before the socket is closed: the callback may already be running. */
+static void deadline_stop(void)
+{
+    if (esp_timer_stop(s_deadline.timer) != ESP_OK) {
+        while (!s_deadline.cb_done) {
+            vTaskDelay(1);
+        }
     }
-    if (left_us > (int64_t)SOCKET_TIMEOUT_MS * 1000) {
-        left_us = (int64_t)SOCKET_TIMEOUT_MS * 1000;
-    }
-    int timeout_ms = (int)(left_us / 1000);
-    if (timeout_ms <= 0) {
-        timeout_ms = 1;
-    }
-    return sock_wait(sock, for_write, timeout_ms);
 }
 
 static void close_socket(int sock)
@@ -237,14 +258,6 @@ static int connect_server(uint16_t port)
     }
 
     set_socket_timeout(sock, SOCKET_TIMEOUT_MS);
-    /* 1024 is below the TCP MSS, so Nagle holds the segment until an ACK.
-     * The peer then delays that ACK. Upload never leaves the device. */
-    int nodelay = 1;
-    if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) != 0) {
-        printf("connect error: %s\n", strerror(errno));
-        close_socket(sock);
-        return -1;
-    }
     printf("connected, testing...\n");
     return sock;
 }
@@ -254,9 +267,54 @@ static unsigned kb_per_s(size_t total)
     return (unsigned)((total + 512U) / 1024U / TEST_DURATION_S);
 }
 
-static int64_t test_deadline(void)
+/* Blocking recv until EOF, error, or the deadline timer shuts the socket down. */
+static size_t download_loop(int sock)
 {
-    return esp_timer_get_time() + (int64_t)TEST_DURATION_S * 1000000;
+    uint8_t buf[IO_BUFFER_SIZE];
+    size_t total = 0;
+
+    for (;;) {
+        int n = recv(sock, buf, sizeof(buf), 0);
+        if (n > 0) {
+            total += (size_t)n;
+            continue;
+        }
+        if (s_deadline.expired) {
+            break;
+        }
+        if (n == 0) {
+            printf("read EOF\n");
+        } else {
+            printf("read error: %s\n", strerror(errno));
+        }
+        break;
+    }
+    return total;
+}
+
+static size_t upload_loop(int sock)
+{
+    uint8_t buf[IO_BUFFER_SIZE] = { 0 };
+    size_t total = 0;
+
+    for (;;) {
+        int n = send(sock, buf, sizeof(buf), 0);
+        if (n > 0) {
+            total += (size_t)n;
+            continue;
+        }
+        if (s_deadline.expired) {
+            break;
+        }
+        if (n == 0) {
+            /* Split so "??!" is not a C trigraph. */
+            printf("write zero?!?" "?!" "?!\n");
+        } else {
+            printf("write error: %s\n", strerror(errno));
+        }
+        break;
+    }
+    return total;
 }
 
 static size_t test_download(void)
@@ -268,29 +326,9 @@ static size_t test_download(void)
         return 0;
     }
 
-    uint8_t buf[IO_BUFFER_SIZE];
-    size_t total = 0;
-    int64_t deadline = test_deadline();
-    while (esp_timer_get_time() < deadline) {
-        int n = recv(sock, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n > 0) {
-            total += (size_t)n;
-            continue;
-        }
-        if (n == 0) {
-            printf("read EOF\n");
-            break;
-        }
-        if (!would_block(errno)) {
-            printf("read error: %s\n", strerror(errno));
-            break;
-        }
-        int rc = sock_wait_until(sock, false, deadline);
-        if (rc < 0 && errno != EINTR) {
-            printf("read error: %s\n", strerror(errno));
-            break;
-        }
-    }
+    deadline_start(sock);
+    size_t total = download_loop(sock);
+    deadline_stop();
 
     close_socket(sock);
     unsigned kbps = kb_per_s(total);
@@ -307,32 +345,9 @@ static size_t test_upload(void)
         return 0;
     }
 
-    uint8_t buf[IO_BUFFER_SIZE] = { 0 };
-    size_t total = 0;
-    int64_t deadline = test_deadline();
-    while (esp_timer_get_time() < deadline) {
-        /* MSG_DONTWAIT: lwIP's blocking send waits until the TCP poll task
-         * notices a full buffer, so the 15s test never gets to finish. */
-        int n = send(sock, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n > 0) {
-            total += (size_t)n;
-            continue;
-        }
-        if (n == 0) {
-            /* Split so "??!" is not a C trigraph. */
-            printf("write zero?!?" "?!" "?!\n");
-            break;
-        }
-        if (!would_block(errno)) {
-            printf("write error: %s\n", strerror(errno));
-            break;
-        }
-        int rc = sock_wait_until(sock, true, deadline);
-        if (rc < 0 && errno != EINTR) {
-            printf("write error: %s\n", strerror(errno));
-            break;
-        }
-    }
+    deadline_start(sock);
+    size_t total = upload_loop(sock);
+    deadline_stop();
 
     close_socket(sock);
     unsigned kbps = kb_per_s(total);
@@ -343,34 +358,7 @@ static size_t test_upload(void)
 static void upload_task(void *arg)
 {
     bidi_ctx_t *ctx = arg;
-    uint8_t buf[IO_BUFFER_SIZE] = { 0 };
-
-    while (!ctx->cancel && esp_timer_get_time() < ctx->deadline) {
-        int n = send(ctx->sock, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n > 0) {
-            continue;
-        }
-        if (ctx->cancel || esp_timer_get_time() >= ctx->deadline) {
-            break;
-        }
-        if (n == 0) {
-            printf("write zero?!?" "?!" "?!\n");
-            break;
-        }
-        if (!would_block(errno)) {
-            printf("write error: %s\n", strerror(errno));
-            break;
-        }
-        int rc = sock_wait_until(ctx->sock, true, ctx->deadline);
-        if (ctx->cancel || esp_timer_get_time() >= ctx->deadline) {
-            break;
-        }
-        if (rc < 0 && errno != EINTR) {
-            printf("write error: %s\n", strerror(errno));
-            break;
-        }
-    }
-
+    (void)upload_loop(ctx->sock);
     ctx->tx_done = true;
     vTaskDelete(NULL);
 }
@@ -378,37 +366,7 @@ static void upload_task(void *arg)
 static void download_task(void *arg)
 {
     bidi_ctx_t *ctx = arg;
-    uint8_t buf[IO_BUFFER_SIZE];
-    size_t total = 0;
-
-    while (!ctx->cancel && esp_timer_get_time() < ctx->deadline) {
-        int n = recv(ctx->sock, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n > 0) {
-            total += (size_t)n;
-            continue;
-        }
-        if (ctx->cancel || esp_timer_get_time() >= ctx->deadline) {
-            break;
-        }
-        if (n == 0) {
-            printf("read EOF\n");
-            break;
-        }
-        if (!would_block(errno)) {
-            printf("read error: %s\n", strerror(errno));
-            break;
-        }
-        int rc = sock_wait_until(ctx->sock, false, ctx->deadline);
-        if (ctx->cancel || esp_timer_get_time() >= ctx->deadline) {
-            break;
-        }
-        if (rc < 0 && errno != EINTR) {
-            printf("read error: %s\n", strerror(errno));
-            break;
-        }
-    }
-
-    ctx->total = total;
+    ctx->total = download_loop(ctx->sock);
     ctx->rx_done = true;
     vTaskDelete(NULL);
 }
@@ -424,8 +382,8 @@ static size_t test_upload_download(void)
 
     bidi_ctx_t ctx = {
         .sock = sock,
-        .deadline = test_deadline(),
     };
+    deadline_start(sock);
     BaseType_t tx_ok = xTaskCreate(upload_task, "bench_tx", BIDI_TASK_STACK, &ctx, 1, NULL);
     BaseType_t rx_ok = xTaskCreate(download_task, "bench_rx", BIDI_TASK_STACK, &ctx, 1, NULL);
     if (tx_ok != pdPASS) {
@@ -435,18 +393,14 @@ static size_t test_upload_download(void)
         ctx.rx_done = true;
     }
     if (tx_ok != pdPASS || rx_ok != pdPASS) {
-        ctx.cancel = true;
         printf("write error: failed to start transfer\n");
+        shutdown(sock, SHUT_RDWR);
     }
 
-    while ((!ctx.tx_done || !ctx.rx_done) && esp_timer_get_time() < ctx.deadline) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    ctx.cancel = true;
-    shutdown(sock, SHUT_RDWR);
     while (!ctx.tx_done || !ctx.rx_done) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    deadline_stop();
 
     close_socket(sock);
     unsigned kbps = kb_per_s(ctx.total);
@@ -468,6 +422,8 @@ void app_main(void)
         printf("Invalid HOST_IP address\n");
         return;
     }
+
+    deadline_init();
 
     printf("Starting wifi\n");
     wifi_init();
